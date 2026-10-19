@@ -1,5 +1,6 @@
 import Foundation
 import SQLite3
+import Darwin
 
 enum MailCLIError: Error, CustomStringConvertible {
     case mailRootNotFound
@@ -69,12 +70,12 @@ struct MailCLI {
             let paths = try discoverMailPaths()
             let args = Array(CommandLine.arguments.dropFirst())
 
-            guard let command = args.first else {
-                printUsage()
-                return
-            }
+            let command = args.first ?? "browse"
 
             switch command {
+            case "browse":
+                try handleBrowse(args: Array(args.dropFirst()), paths: paths)
+
             case "search", "s":
                 try handleSearch(
                     args: Array(args.dropFirst()),
@@ -106,6 +107,7 @@ struct MailCLI {
     static func printUsage() {
         print("""
         Usage:
+          mq [browse [search <text>] [--limit N]]
           mq search|s <text> [--limit N | -l N]
           mq list|l [--limit N | -l N]
           mq read|r <ROWID>
@@ -260,7 +262,8 @@ func handleList(
 
 // MARK: - SQLite search
 
-func searchMail(
+struct MailDatabase {
+static func search(
     databaseURL: URL,
     query: String?,
     limit: Int
@@ -299,6 +302,11 @@ func searchMail(
 
     defer {
         sqlite3_close(db)
+    }
+
+    // Keep SQLite sorting/working storage in memory, even for large limits.
+    guard sqlite3_exec(db, "PRAGMA temp_store=MEMORY", nil, nil, nil) == SQLITE_OK else {
+        throw MailCLIError.sqlitePrepareFailed(String(cString: sqlite3_errmsg(db)))
     }
 
     let sql = """
@@ -463,6 +471,12 @@ func searchMail(
     return results
 }
 
+}
+
+func searchMail(databaseURL: URL, query: String?, limit: Int) throws -> [SearchResult] {
+    try MailDatabase.search(databaseURL: databaseURL, query: query, limit: limit)
+}
+
 func columnText(
     _ stmt: OpaquePointer?,
     index: Int32
@@ -625,7 +639,8 @@ func handleRead(
 
 // MARK: - Locate EMLX
 
-func locateMessage(
+struct MailMessageLocator {
+static func locate(
     id: Int64,
     paths: MailPaths
 ) throws -> URL {
@@ -647,6 +662,7 @@ func locateMessage(
 
     for case let url as URL in enumerator {
 
+        if terminalSignal != 0 { throw TerminalError.failure("Interrotto.") }
         let name = url.lastPathComponent
 
         if name == expectedEMLX ||
@@ -660,164 +676,17 @@ func locateMessage(
 }
 
 
-// MARK: - EMLX parsing
-
-func parseEMLX(
-    url: URL
-) throws -> ParsedMail {
-
-    let data = try Data(
-        contentsOf: url
-    )
-
-    guard
-        let firstNewline = data.firstIndex(of: 0x0A)
-    else {
-        throw MailCLIError.unsupportedMessageFormat(
-            "Prima riga EMLX non trovata."
-        )
-    }
-
-    let lengthData = data[
-        ..<firstNewline
-    ]
-
-    guard
-        let lengthString = String(
-            data: lengthData,
-            encoding: .ascii
-        ),
-        let messageLength = Int(
-            lengthString.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            )
-        )
-    else {
-        throw MailCLIError.unsupportedMessageFormat(
-            "Lunghezza EMLX non valida."
-        )
-    }
-
-    let messageStart = data.index(
-        after: firstNewline
-    )
-
-    guard
-        messageLength >= 0,
-        messageStart + messageLength <= data.endIndex
-    else {
-        throw MailCLIError.unsupportedMessageFormat(
-            "Lunghezza EMLX fuori intervallo."
-        )
-    }
-
-    let messageData = data[
-        messageStart ..<
-        messageStart + messageLength
-    ]
-
-    guard
-        let raw = String(
-            data: messageData,
-            encoding: .utf8
-        )
-    else {
-        throw MailCLIError.unsupportedMessageFormat(
-            "Messaggio RFC822 non UTF-8."
-        )
-    }
-
-    let normalized = raw.replacingOccurrences(
-        of: "\r\n",
-        with: "\n"
-    )
-
-    guard
-        let separator = normalized.range(
-            of: "\n\n"
-        )
-    else {
-        throw MailCLIError.unsupportedMessageFormat(
-            "Separatore header/body non trovato."
-        )
-    }
-
-    let headerBlock = String(
-        normalized[
-            ..<separator.lowerBound
-        ]
-    )
-
-    let rawBody = String(
-        normalized[
-            separator.upperBound...
-        ]
-    )
-
-    let headers = parseHeaders(
-        headerBlock
-    )
-
-    let contentType =
-        headers["content-type"]
-        ?? "text/plain"
-
-    let encoding =
-        headers[
-            "content-transfer-encoding"
-        ]?
-        .lowercased()
-        .trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        ?? ""
-
-    let body: String
-
-    if contentType
-        .lowercased()
-        .contains("multipart/") {
-
-        body =
-            extractPlainTextFromMultipart(
-                body: rawBody,
-                contentType: contentType
-            )
-            ??
-            "[Nessun corpo text/plain disponibile localmente]"
-
-    } else {
-
-        body = decodeBody(
-            rawBody,
-            encoding: encoding
-        )
-    }
-
-    return ParsedMail(
-        from: decodeMIMEHeader(
-            headers["from"] ?? ""
-        ),
-
-        to: decodeMIMEHeader(
-            headers["to"] ?? ""
-        ),
-
-        cc: decodeMIMEHeader(
-            headers["cc"] ?? ""
-        ),
-
-        date:
-            headers["date"] ?? "",
-
-        subject: decodeMIMEHeader(
-            headers["subject"] ?? ""
-        ),
-
-        body: body
-    )
 }
 
+func locateMessage(id: Int64, paths: MailPaths) throws -> URL {
+    try MailMessageLocator.locate(id: id, paths: paths)
+}
+
+// MARK: - EMLX parsing
+
+func parseEMLX(url: URL) throws -> ParsedMail {
+    try EMLXParser.parse(data: Data(contentsOf: url))
+}
 
 // MARK: - RFC822 headers
 
@@ -885,393 +754,520 @@ func parseHeaders(
 }
 
 
-// MARK: - Multipart MIME
+// MARK: - Byte-preserving MIME parser
 
-func extractPlainTextFromMultipart(
-    body: String,
-    contentType: String
-) -> String? {
+struct EMLXParser {
+    static func parse(data: Data) throws -> ParsedMail {
+        guard let newline = data.firstIndex(of: 10),
+              let countString = String(data: data[..<newline], encoding: .ascii),
+              let count = Int(countString.trimmingCharacters(in: .whitespacesAndNewlines)),
+              count >= 0, count <= data.count - newline - 1 else {
+            throw MailCLIError.unsupportedMessageFormat("Lunghezza EMLX non valida.")
+        }
+        // Latin-1 is used only as a lossless byte transport before charset decoding.
+        let bytes = data[(newline + 1)..<(newline + 1 + count)]
+        let raw = String(bytes.map { Character(UnicodeScalar($0)) })
+            .replacingOccurrences(of: "\r\n", with: "\n")
+        guard let (headers, body) = split(raw) else {
+            throw MailCLIError.unsupportedMessageFormat("Separatore header/body non trovato.")
+        }
+        let parts = content(headers, body, depth: 0)
+        func header(_ name: String) -> String {
+            decodeMIMEHeader(decode(bytesOf(headers[name] ?? ""), charset: nil))
+        }
+        return ParsedMail(from: header("from"), to: header("to"), cc: header("cc"),
+                          date: header("date"), subject: header("subject"),
+                          body: parts.plain ?? parts.html ?? "[Nessun corpo leggibile disponibile localmente]")
+    }
 
-    guard
-        let boundary = extractBoundary(
-            from: contentType
-        )
-    else {
+    static func bytesOf(_ text: String) -> Data {
+        Data(text.unicodeScalars.map { UInt8(truncatingIfNeeded: $0.value) })
+    }
+
+    static func split(_ raw: String) -> ([String: String], String)? {
+        if raw.hasPrefix("\n") { return ([:], String(raw.dropFirst())) }
+        guard let range = raw.range(of: "\n\n") else { return nil }
+        return (parseHeaders(String(raw[..<range.lowerBound])), String(raw[range.upperBound...]))
+    }
+
+    static func parameter(_ name: String, in value: String) -> String? {
+        let pattern = "(?i)(?:^|;)\\s*" + name + #"\s*=\s*(?:"([^"]*)"|([^;\s]+))"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) else { return nil }
+        for index in 1...2 {
+            if let range = Range(match.range(at: index), in: value) { return String(value[range]) }
+        }
         return nil
     }
 
-    let marker = "--\(boundary)"
-
-    let parts = body.components(
-        separatedBy: marker
-    )
-
-    for part in parts {
-
-        let cleaned = part.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-
-        if cleaned.isEmpty ||
-           cleaned == "--" {
-            continue
+    static func content(_ headers: [String: String], _ body: String, depth: Int) -> (plain: String?, html: String?) {
+        guard depth < 40 else { return (nil, nil) }
+        let type = headers["content-type"] ?? "text/plain"
+        let media = type.components(separatedBy: ";")[0].trimmingCharacters(in: .whitespaces).lowercased()
+        if (headers["content-disposition"] ?? "").lowercased().hasPrefix("attachment") { return (nil, nil) }
+        if media.hasPrefix("multipart/") {
+            guard let boundary = parameter("boundary", in: type), !boundary.isEmpty else { return (nil, nil) }
+            var parts: [String] = [], current: [String]? = nil
+            for line in body.components(separatedBy: "\n") {
+                let marker = line.replacingOccurrences(of: "[ \t]+$", with: "", options: .regularExpression)
+                if marker == "--" + boundary || marker == "--" + boundary + "--" {
+                    if let current { parts.append(current.joined(separator: "\n")) }
+                    current = nil
+                    if marker.hasSuffix(boundary + "--") { break }
+                    current = []
+                } else if current != nil { current!.append(line) }
+            }
+            if let current { parts.append(current.joined(separator: "\n")) }
+            var plain: [String] = [], html: [String] = []
+            for part in parts {
+                guard let (h, b) = split(part) else { continue }
+                let found = content(h, b, depth: depth + 1)
+                if let text = found.plain { plain.append(text) }
+                if let text = found.html { html.append(text) }
+            }
+            return (plain.isEmpty ? nil : plain.joined(separator: "\n\n"),
+                    html.isEmpty ? nil : html.joined(separator: "\n\n"))
         }
+        guard media == "text/plain" || media == "text/html" else { return (nil, nil) }
+        let encoding = (headers["content-transfer-encoding"] ?? "").lowercased()
+        var data = bytesOf(body)
+        if encoding == "base64" { data = Data(base64Encoded: data, options: .ignoreUnknownCharacters) ?? data }
+        if encoding == "quoted-printable" { data = quotedPrintable(data) }
+        let text = decode(data, charset: parameter("charset", in: type))
+        return media == "text/plain" ? (text, nil) : (nil, htmlText(text))
+    }
 
-        let normalized = cleaned.replacingOccurrences(
-            of: "\r\n",
-            with: "\n"
-        )
-
-        guard
-            let separator = normalized.range(
-                of: "\n\n"
-            )
-        else {
-            continue
+    static func decode(_ data: Data, charset: String?) -> String {
+        let encoding: String.Encoding
+        switch charset?.lowercased() {
+        case "iso-8859-1", "latin1", "latin-1": encoding = .isoLatin1
+        case "windows-1252", "cp1252": encoding = .windowsCP1252
+        case "us-ascii", "ascii": encoding = .ascii
+        default: encoding = .utf8
         }
+        return String(data: data, encoding: encoding) ?? String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .windowsCP1252) ?? String(data: data, encoding: .isoLatin1)
+            ?? String(decoding: data, as: UTF8.self)
+    }
 
-        let headerBlock = String(
-            normalized[
-                ..<separator.lowerBound
-            ]
-        )
+    static func quotedPrintable(_ data: Data) -> Data {
+        let bytes = Array(data)
+        var output: [UInt8] = [], i = 0
+        while i < bytes.count {
+            if bytes[i] == 61 {
+                if i + 1 < bytes.count && bytes[i + 1] == 10 { i += 2; continue }
+                if i + 2 < bytes.count && bytes[i + 1] == 13 && bytes[i + 2] == 10 { i += 3; continue }
+                if i + 2 < bytes.count,
+                   let h = Int(String(UnicodeScalar(bytes[i + 1])), radix: 16),
+                   let l = Int(String(UnicodeScalar(bytes[i + 2])), radix: 16) {
+                    output.append(UInt8(h * 16 + l)); i += 3; continue
+                }
+            }
+            output.append(bytes[i]); i += 1
+        }
+        return Data(output)
+    }
 
-        let partBody = String(
-            normalized[
-                separator.upperBound...
-            ]
-        )
-
-        let headers = parseHeaders(
-            headerBlock
-        )
-
-        let ct =
-            headers["content-type"]?
-                .lowercased()
-            ?? "text/plain"
-
-        if ct.contains("multipart/") {
-
-            if let nested =
-                extractPlainTextFromMultipart(
-                    body: partBody,
-                    contentType: ct
-                ) {
-
-                return nested
+    static func htmlText(_ html: String) -> String {
+        var text = html
+        for (pattern, replacement) in [
+            (#"(?is)<(script|style)\b[^>]*>.*?</\1\s*>"#, ""),
+            (#"(?s)<!--.*?-->"#, ""),
+            (#"(?i)<br\b[^>]*>"#, "\n"),
+            (#"(?i)</?p\b[^>]*>"#, "\n\n"),
+            (#"(?i)</?(div|tr|h[1-6])\b[^>]*>"#, "\n"),
+            (#"(?i)<li\b[^>]*>"#, "\n• "),
+            (#"(?i)</(li|td|th)\s*>"#, " "),
+            (#"(?s)<[^>]*>"#, "")
+        ] { text = text.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression) }
+        let entities = ["amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
+                        "ndash": "–", "mdash": "—", "hellip": "…", "lsquo": "‘", "rsquo": "’",
+                        "ldquo": "“", "rdquo": "”", "copy": "©", "reg": "®", "euro": "€"]
+        if let regex = try? NSRegularExpression(pattern: #"&(#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z]+);"#) {
+            for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
+                guard let range = Range(match.range, in: text), let keyRange = Range(match.range(at: 1), in: text) else { continue }
+                let key = String(text[keyRange])
+                var value = entities[key]
+                if key.hasPrefix("#") {
+                    let hex = key.hasPrefix("#x")
+                    if let number = UInt32(key.dropFirst(hex ? 2 : 1), radix: hex ? 16 : 10), let scalar = UnicodeScalar(number) {
+                        value = String(scalar)
+                    }
+                }
+                if let value { text.replaceSubrange(range, with: value) }
             }
         }
+        return text.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "\n[ \t]+", with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: "\n{3,}", with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
 
-        if ct.contains("text/plain") {
+func decodeMIMEHeader(_ input: String) -> String {
+    guard let regex = try? NSRegularExpression(pattern: #"=\?([^?]+)\?([bBqQ])\?([^?]*)\?="#) else { return input }
+    var result = "", cursor = input.startIndex, previousEncoded = false
+    for match in regex.matches(in: input, range: NSRange(input.startIndex..., in: input)) {
+        guard let whole = Range(match.range, in: input), let charset = Range(match.range(at: 1), in: input),
+              let encoding = Range(match.range(at: 2), in: input), let payload = Range(match.range(at: 3), in: input) else { continue }
+        let gap = String(input[cursor..<whole.lowerBound])
+        let data: Data?
+        if input[encoding].lowercased() == "b" { data = Data(base64Encoded: String(input[payload])) }
+        else { data = EMLXParser.quotedPrintable(Data(input[payload].replacingOccurrences(of: "_", with: " ").utf8)) }
+        if !(previousEncoded && data != nil && gap.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) { result += gap }
+        result += data.map { EMLXParser.decode($0, charset: String(input[charset])) } ?? String(input[whole])
+        previousEncoded = data != nil
+        cursor = whole.upperBound
+    }
+    return result + input[cursor...]
+}
 
-            let encoding =
-                headers[
-                    "content-transfer-encoding"
-                ]?
-                .lowercased()
-                .trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                )
-                ?? ""
+// MARK: - Terminal lifecycle and input
 
-            return decodeBody(
-                partBody,
-                encoding: encoding
-            )
+private var terminalSignal: sig_atomic_t = 0
+private func handleTerminalSignal(_ number: Int32) { terminalSignal = number }
+
+enum TerminalError: Error, CustomStringConvertible {
+    case failure(String)
+    var description: String { switch self { case .failure(let message): return message } }
+}
+
+enum TerminalKey {
+    case up, down, pageUp, pageDown, enter, quit, escape, search, delete, other, end
+    case text(String)
+}
+
+final class TerminalController {
+    private var original = termios()
+    private var active = false
+    private var savedSignals: [(Int32, sigaction)] = []
+    private var pending: [UInt8] = []
+    private var utf8Input: [UInt8] = []
+    var lastFrame = ""
+
+    func start() throws {
+        guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 else {
+            throw TerminalError.failure("La modalità browse richiede un terminale interattivo; usa mq l o mq search.")
+        }
+        guard tcgetattr(STDIN_FILENO, &original) == 0 else { throw TerminalError.failure("tcgetattr fallita.") }
+        terminalSignal = 0
+        for number in [SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP, SIGPIPE] {
+            var action = sigaction(), old = sigaction()
+            action.__sigaction_u.__sa_handler = handleTerminalSignal
+            sigemptyset(&action.sa_mask)
+            if sigaction(number, &action, &old) != 0 {
+                restore()
+                throw TerminalError.failure("Impossibile installare il gestore segnali.")
+            }
+            savedSignals.append((number, old))
+        }
+        var raw = original
+        cfmakeraw(&raw)
+        // Poll with a timeout: signals and resize are handled on the main thread.
+        withUnsafeMutableBytes(of: &raw.c_cc) { bytes in
+            bytes[Int(VMIN)] = 0
+            bytes[Int(VTIME)] = 1
+        }
+        guard tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0 else {
+            restore(); throw TerminalError.failure("Impossibile attivare raw mode.")
+        }
+        active = true
+        send("\u{1B}[?1049h\u{1B}[?25l\u{1B}[0m")
+    }
+
+    func restore() {
+        if active {
+            send("\u{1B}[0m\u{1B}[?25h\u{1B}[?1049l")
+            while tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0 && errno == EINTR {}
+            active = false
+        }
+        for (number, saved) in savedSignals {
+            var action = saved
+            sigaction(number, &action, nil)
+        }
+        savedSignals.removeAll()
+    }
+    deinit { restore() }
+
+    func send(_ text: String) {
+        let bytes = Array(text.utf8)
+        bytes.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let count = Darwin.write(STDOUT_FILENO, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if count > 0 { offset += count }
+                else if count < 0 && errno == EINTR { continue }
+                else { break }
+            }
         }
     }
 
-    return nil
-}
+    var size: (rows: Int, columns: Int) {
+        var dimensions = winsize()
+        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &dimensions) == 0, dimensions.ws_row > 0, dimensions.ws_col > 0 {
+            return (Int(dimensions.ws_row), Int(dimensions.ws_col))
+        }
+        return (24, 80)
+    }
 
-
-// MARK: - MIME boundary
-
-func extractBoundary(
-    from contentType: String
-) -> String? {
-
-    let lower = contentType.lowercased()
-
-    guard
-        let range = lower.range(
-            of: "boundary="
-        )
-    else {
+    private func byte() throws -> UInt8? {
+        if !pending.isEmpty { return pending.removeFirst() }
+        var value: UInt8 = 0
+        let count = Darwin.read(STDIN_FILENO, &value, 1)
+        if count == 1 { return value }
+        if count < 0 && errno != EINTR { throw TerminalError.failure("Lettura del terminale fallita.") }
+        var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        if poll(&descriptor, 1, 0) > 0 && descriptor.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
+            throw TerminalError.failure("Terminale disconnesso.")
+        }
         return nil
     }
 
-    var value = String(
-        contentType[
-            range.upperBound...
-        ]
-    )
-
-    value = value.trimmingCharacters(
-        in: .whitespacesAndNewlines
-    )
-
-    if value.hasPrefix("\"") {
-
-        value.removeFirst()
-
-        if let quote = value.firstIndex(
-            of: "\""
-        ) {
-            value = String(
-                value[..<quote]
-            )
+    func key(textInput: Bool = false) throws -> TerminalKey {
+        if terminalSignal != 0 { return .end }
+        guard let first = try byte() else { return .other }
+        if textInput && first >= 32 && first != 127 {
+            if first < 128 {
+                utf8Input.removeAll()
+                return .text(String(UnicodeScalar(first)))
+            }
+            if first >= 0xC2 && first <= 0xF4 { utf8Input = [first] }
+            else if first >= 0x80 && first <= 0xBF && !utf8Input.isEmpty { utf8Input.append(first) }
+            else { utf8Input.removeAll(); return .other }
+            let expected = utf8Input[0] < 0xE0 ? 2 : (utf8Input[0] < 0xF0 ? 3 : 4)
+            if utf8Input.count == expected {
+                let text = String(bytes: utf8Input, encoding: .utf8)
+                utf8Input.removeAll()
+                if let text { return .text(TerminalRenderer.safe(text)) }
+            }
+            return .other
         }
-
-    } else {
-
-        if let semicolon = value.firstIndex(
-            of: ";"
-        ) {
-            value = String(
-                value[..<semicolon]
-            )
+        utf8Input.removeAll()
+        switch first {
+        case 3: terminalSignal = SIGINT; return .end
+        case 4: return .end
+        case 26: terminalSignal = SIGTSTP; return .end
+        case 113: return .quit
+        case 115: return .search
+        case 8, 127: return .delete
+        case 106: return .down
+        case 107: return .up
+        case 10, 13: return .enter
+        case 27:
+            guard let second = try byte() else { return .escape }
+            guard second == 91 || second == 79 else { pending.append(second); return .escape }
+            var sequence: [UInt8] = []
+            for _ in 0..<16 {
+                guard let next = try byte() else { return .other }
+                sequence.append(next)
+                if next >= 64 && next <= 126 { break }
+            }
+            switch String(decoding: sequence, as: UTF8.self) {
+            case "A": return .up
+            case "B": return .down
+            case "5~": return .pageUp
+            case "6~": return .pageDown
+            case "3~": return .delete
+            default: return .other
+            }
+        default: return .other
         }
-    }
-
-    return value
-}
-
-
-// MARK: - Content Transfer Encoding
-
-func decodeBody(
-    _ body: String,
-    encoding: String
-) -> String {
-
-    switch encoding {
-
-    case "base64":
-
-        let compact = body.components(
-            separatedBy: .whitespacesAndNewlines
-        ).joined()
-
-        guard
-            let data = Data(
-                base64Encoded: compact,
-                options: [.ignoreUnknownCharacters]
-            )
-        else {
-            return body
-        }
-
-        return
-            String(
-                data: data,
-                encoding: .utf8
-            )
-            ?? body
-
-
-    case "quoted-printable":
-
-        return decodeQuotedPrintable(
-            body
-        )
-
-
-    default:
-
-        return body
     }
 }
 
+// MARK: - Safe terminal rendering
 
-// MARK: - Quoted Printable
+struct TerminalRenderer {
+    static func safe(_ text: String) -> String {
+        String(text.unicodeScalars.filter { $0.value >= 32 && !($0.value >= 127 && $0.value <= 159) && $0.value != 0x2028 && $0.value != 0x2029 })
+    }
+    static func width(_ character: Character) -> Int {
+        let widths = character.unicodeScalars.map { max(0, Int(wcwidth(wchar_t($0.value)))) }
+        if character.unicodeScalars.contains(where: { $0.value == 0x200D || $0.value == 0xFE0F }) { return max(2, widths.max() ?? 0) }
+        return widths.reduce(0, +)
+    }
+    static func fit(_ text: String, _ columns: Int, pad: Bool = false) -> String {
+        var result = "", used = 0
+        for character in safe(text) {
+            let count = width(character)
+            if used + count > max(0, columns) { break }
+            result.append(character); used += count
+        }
+        if pad { result += String(repeating: " ", count: max(0, columns - used)) }
+        return result
+    }
+    static func wrap(_ text: String, columns: Int) -> [String] {
+        let limit = max(1, columns)
+        var lines: [String] = []
+        for line in text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n") {
+            let clean = safe(line.replacingOccurrences(of: "\t", with: "    "))
+            let quoted = clean.trimmingCharacters(in: .whitespaces).hasPrefix(">")
+            var buffer = "", used = 0
+            for character in clean {
+                let count = width(character)
+                if used + count > limit && !buffer.isEmpty {
+                    lines.append(quoted ? "\u{1B}[2m" + buffer + "\u{1B}[0m" : buffer)
+                    buffer = ""; used = 0
+                }
+                if count <= limit { buffer.append(character); used += count }
+            }
+            lines.append(quoted ? "\u{1B}[2m" + buffer + "\u{1B}[0m" : buffer)
+        }
+        return lines
+    }
+    static func date(_ date: String) -> String {
+        let parts = date.components(separatedBy: " ")
+        let ymd = (parts.first ?? "").components(separatedBy: "-")
+        guard ymd.count == 3, parts.count > 1 else { return date }
+        return "\(ymd[2])/\(ymd[1])/\(ymd[0]) \(parts[1].prefix(5))"
+    }
+    static func row(date: String, sender: String, subject: String, columns: Int) -> String {
+        if columns < 42 { return fit(sender + "  " + subject, columns) }
+        let senderWidth = min(40, max(10, (columns - 19) / 3))
+        return fit(fit(date, 16, pad: true) + "  " + fit(sender, senderWidth, pad: true) + "  " + subject, columns)
+    }
+    static func frame(_ lines: [String], status: String, terminal: TerminalController) {
+        let size = terminal.size
+        var output = "\u{1B}[H"
+        for index in 0..<max(0, size.rows - 1) {
+            output += "\u{1B}[0m\u{1B}[2K" + (index < lines.count ? lines[index] : "") + "\r\n"
+        }
+        output += "\u{1B}[0m\u{1B}[2K\u{1B}[7m" + fit(status, max(0, size.columns - 1), pad: true) + "\u{1B}[0m"
+        if terminal.lastFrame != output {
+            terminal.send(output)
+            terminal.lastFrame = output
+        }
+    }
+}
 
-func decodeQuotedPrintable(
-    _ input: String
-) -> String {
+enum ViewState { case list, searchInput, message }
 
-    let bytes = Array(
-        input.utf8
-    )
+struct InteractiveMailBrowser {
+    let paths: MailPaths
+    let results: [SearchResult]
+    var initialQuery: String? = nil
+    var limit: Int = 100
 
-    var output: [UInt8] = []
-
-    var i = 0
-
-    while i < bytes.count {
-
-        if bytes[i] == 61 {
-
-            if
-                i + 1 < bytes.count,
-                bytes[i + 1] == 10 {
-
-                i += 2
+    func run() throws {
+        // Retain the unfiltered list separately, including when launched with browse search.
+        let latest = try initialQuery == nil ? results : searchMail(databaseURL: paths.database, query: nil, limit: limit)
+        var displayed = results
+        var currentQuery = initialQuery
+        var state = ViewState.list
+        var input = ""
+        setlocale(LC_CTYPE, "")
+        let terminal = TerminalController()
+        try terminal.start()
+        defer { terminal.restore() }
+        var selected = 0, top = 0, scroll = 0
+        var message: ParsedMail?, notice = ""
+        var wrapped: [String] = [], previousWidth = -1
+        while terminalSignal == 0 {
+            let size = terminal.size, columns = max(1, size.columns - 1)
+            let page = max(1, size.rows - (state == .message ? 1 : 2))
+            if state == .message, let message {
+                if columns != previousWidth {
+                    let text = "From: \(message.from)\nTo: \(message.to)\nCc: \(message.cc)\nDate: \(message.date)\nSubject: \(message.subject)\n\n\(message.body)"
+                    wrapped = TerminalRenderer.wrap(text, columns: columns)
+                    previousWidth = columns
+                }
+                scroll = min(scroll, max(0, wrapped.count - page))
+                TerminalRenderer.frame(Array(wrapped.dropFirst(scroll).prefix(page)),
+                    status: "↑↓ scroll   PgUp/PgDn   q back", terminal: terminal)
+            } else {
+                top = min(top, max(0, displayed.count - page))
+                if selected < top { top = selected }
+                if selected >= top + page { top = selected - page + 1 }
+                var lines = [TerminalRenderer.row(date: "DATA", sender: "MITTENTE", subject: "OGGETTO", columns: columns)]
+                for index in top..<min(displayed.count, top + page) {
+                    let result = displayed[index]
+                    let row = TerminalRenderer.row(date: TerminalRenderer.date(result.date), sender: result.sender, subject: result.subject, columns: columns)
+                    lines.append(index == selected ? "\u{1B}[7m" + TerminalRenderer.fit(row, columns, pad: true) + "\u{1B}[0m" : row)
+                }
+                if displayed.isEmpty {
+                    lines.append(TerminalRenderer.fit(currentQuery.map { "Nessun risultato per \"\($0)\"" } ?? "Nessun messaggio trovato.", columns))
+                }
+                let position = "\(displayed.isEmpty ? 0 : selected + 1)/\(displayed.count)"
+                var status = position + "   ↑↓ move   Enter open   s search   q quit"
+                if let currentQuery {
+                    let hints = columns >= 110
+                        ? "   ↑↓ move   Enter open   s new search   Esc clear   q quit"
+                        : "  ↑↓ move  Enter open  s search  Esc clear  q quit"
+                    let queryWidth = max(1, columns - 11 - position.count - hints.count)
+                    status = "Search: " + TerminalRenderer.fit(currentQuery, queryWidth) + "   " + position + hints
+                }
+                if !notice.isEmpty { status = notice }
+                if state == .searchInput {
+                    // End-only editor: keep the insertion point visible for long queries.
+                    var tail = "", used = 0
+                    for character in input.reversed() {
+                        let width = TerminalRenderer.width(character)
+                        if used + width > max(0, columns - 9) { break }
+                        tail.insert(character, at: tail.startIndex); used += width
+                    }
+                    status = "Search: " + tail + "_"
+                }
+                TerminalRenderer.frame(lines, status: status, terminal: terminal)
+            }
+            let key = try terminal.key(textInput: state == .searchInput)
+            if state == .searchInput {
+                switch key {
+                case .end: return
+                case .escape: state = .list
+                case .text(let text): input += text
+                case .delete: if !input.isEmpty { input.removeLast() }
+                case .enter:
+                    let query = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                    do {
+                        let found = try query.isEmpty ? latest : searchMail(databaseURL: paths.database, query: query, limit: limit)
+                        displayed = found
+                        currentQuery = query.isEmpty ? nil : query
+                        selected = 0; top = 0; notice = ""
+                    } catch { notice = "Errore: \(error) — s riprova, Esc annulla" }
+                    state = .list
+                default: break // Input never dispatches list or message commands.
+                }
                 continue
             }
-
-            if
-                i + 2 < bytes.count,
-                bytes[i + 1] == 13,
-                bytes[i + 2] == 10 {
-
-                i += 3
-                continue
-            }
-
-            if
-                i + 2 < bytes.count,
-                let high = hexValue(
-                    bytes[i + 1]
-                ),
-                let low = hexValue(
-                    bytes[i + 2]
-                ) {
-
-                output.append(
-                    high * 16 + low
-                )
-
-                i += 3
-                continue
+            switch key {
+            case .end: return
+            case .quit, .escape:
+                if state == .message {
+                    message = nil; state = .list; notice = ""
+                } else if case .escape = key, currentQuery != nil {
+                    displayed = latest; currentQuery = nil
+                    selected = 0; top = 0; notice = ""
+                } else { return }
+            case .search:
+                if state == .list { input = currentQuery ?? ""; state = .searchInput }
+            case .up:
+                if state == .message { scroll = max(0, scroll - 1) } else { selected = max(0, selected - 1); notice = "" }
+            case .down:
+                if state == .message { scroll = min(max(0, wrapped.count - page), scroll + 1) }
+                else { selected = min(max(0, displayed.count - 1), selected + 1); notice = "" }
+            case .pageUp: if state == .message { scroll = max(0, scroll - page) }
+            case .pageDown: if state == .message { scroll = min(max(0, wrapped.count - page), scroll + page) }
+            case .enter:
+                if state == .list && !displayed.isEmpty {
+                    terminal.lastFrame = ""
+                    terminal.send("\u{1B}[\(size.rows);1H\u{1B}[2KCaricamento…")
+                    do {
+                        message = try parseEMLX(url: locateMessage(id: displayed[selected].id, paths: paths))
+                        state = .message; scroll = 0; previousWidth = -1
+                    } catch { notice = "Errore: \(error)  — q esce" }
+                }
+            case .other, .delete, .text: break
             }
         }
-
-        output.append(
-            bytes[i]
-        )
-
-        i += 1
-    }
-
-    return
-        String(
-            data: Data(output),
-            encoding: .utf8
-        )
-        ?? input
-}
-
-func hexValue(
-    _ byte: UInt8
-) -> UInt8? {
-
-    switch byte {
-
-    case 48...57:
-        return byte - 48
-
-    case 65...70:
-        return byte - 55
-
-    case 97...102:
-        return byte - 87
-
-    default:
-        return nil
     }
 }
 
-
-// MARK: - MIME encoded headers
-
-func decodeMIMEHeader(
-    _ input: String
-) -> String {
-
-    var result = input
-
-    let pattern =
-        #"=\?([^?]+)\?([bBqQ])\?([^?]+)\?="#
-
-    guard
-        let regex = try? NSRegularExpression(
-            pattern: pattern
-        )
-    else {
-        return input
-    }
-
-    while true {
-
-        let nsRange = NSRange(
-            result.startIndex..<result.endIndex,
-            in: result
-        )
-
-        guard
-            let match = regex.firstMatch(
-                in: result,
-                range: nsRange
-            ),
-
-            match.numberOfRanges == 4,
-
-            let wholeRange = Range(
-                match.range(at: 0),
-                in: result
-            ),
-
-            let encodingRange = Range(
-                match.range(at: 2),
-                in: result
-            ),
-
-            let payloadRange = Range(
-                match.range(at: 3),
-                in: result
-            )
-
-        else {
-            break
-        }
-
-        let encoding = String(
-            result[
-                encodingRange
-            ]
-        ).uppercased()
-
-        let payload = String(
-            result[
-                payloadRange
-            ]
-        )
-
-        var decoded = payload
-
-        if encoding == "B" {
-
-            if let data = Data(
-                base64Encoded: payload
-            ) {
-
-                decoded =
-                    String(
-                        data: data,
-                        encoding: .utf8
-                    )
-                    ?? payload
-            }
-
-        } else if encoding == "Q" {
-
-            let qp = payload.replacingOccurrences(
-                of: "_",
-                with: " "
-            )
-
-            decoded = decodeQuotedPrintable(
-                qp
-            )
-        }
-
-        result.replaceSubrange(
-            wholeRange,
-            with: decoded
-        )
-    }
-
-    return result
+func handleBrowse(args: [String], paths: MailPaths) throws {
+    let searching = args.first == "search" || args.first == "s"
+    let options = try parseLimitArguments(args: searching ? Array(args.dropFirst()) : args, defaultLimit: 100)
+    let query = options.queryParts.joined(separator: " ")
+    guard searching ? !query.isEmpty : query.isEmpty else { throw MailCLIError.invalidArguments }
+    let results = try searchMail(databaseURL: paths.database, query: searching ? query : nil, limit: options.limit)
+    try InteractiveMailBrowser(paths: paths, results: results, initialQuery: searching ? query : nil, limit: options.limit).run()
+    if terminalSignal != 0 { exit(128 + terminalSignal) }
 }
